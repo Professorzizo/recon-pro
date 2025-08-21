@@ -1,0 +1,15 @@
+subfinder
+assetfinder
+httpx
+gau
+gospider
+waybackurls
+nuclei
+dalfox
+ffuf
+jq
+curl
+wget
+unzip
+python3
+pip
