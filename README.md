@@ -3,7 +3,7 @@
 
 ## 📌 Overview
 This project automates the **Recon phase** of Bug Bounty hunting.  
-It collects subdomains, endpoints, JavaScript files, parameters, sensitive URLs, and scans for common vulnerabilities using popular tools.
+It collects subdomains, endpoints, JavaScript files, parameters, sensitive URLs.
 
 
 
