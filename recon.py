@@ -1,167 +1,159 @@
 #!/usr/bin/env python3
-"""
-pro_recon.py
-
-Professional Recon pipeline (single-file) that orchestrates common recon CLIs and Python tools:
-- Runs: subfinder, assetfinder, crt.sh query
-- Optionally runs: gau, waybackurls, gf patterns (xss, sqli, lfi, rce, redirect)
-- Collects interesting endpoints (login, rest, password, update)
-- Collects 403 URLs
-- Extracts JS files
-- Consolidates and deduplicates subdomains and URLs
-- Checks alive subdomains and URLs (async, fast)
-- Extracts PHP URLs to php.txt and parameters to params files
-- Installs missing tools and Python dependencies automatically
-- Uses rich for colored UI and setproctitle to set process name (optional)
-"""
-
-import argparse
-import asyncio
-import json
-import os
-import re
-import shutil
-import subprocess
-import sys
-import time
-from datetime import datetime
+import argparse, asyncio, subprocess, shutil, os
 from pathlib import Path
-from typing import List, Set
-
-console_imported = False
-try:
-    import requests
-    import httpx
-    from rich.console import Console
-    from rich.panel import Panel
-    console_imported = True
-except ImportError:
-    pass
-
-console = Console() if console_imported else None
-
-# ---- check and install required tools ----
-REQUIRED_CLI_TOOLS = ['subfinder', 'assetfinder', 'gau', 'waybackurls', 'gf']
-PYTHON_LIBS = ['requests', 'httpx', 'rich']
-
-def install_missing():
-    for lib in PYTHON_LIBS:
-        try:
-            __import__(lib)
-        except ImportError:
-            print(f"[!] Installing missing Python library: {lib}")
-            subprocess.run([sys.executable, '-m', 'pip', 'install', lib])
-
-    for tool in REQUIRED_CLI_TOOLS:
-        if shutil.which(tool) is None:
-            print(f"[!] CLI tool missing: {tool}. Please install it manually or via package manager.")
-
-install_missing()
-
-# ---- rest of imports ----
-try:
-    from setproctitle import setproctitle
-except Exception:
-    setproctitle = None
+from rich.console import Console
+from rich.panel import Panel
 
 console = Console()
 
 # ---- utilities ----
-
-def now_str():
-    return datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-
-def run_cmd(cmd: List[str], capture_output=True, check=False, shell=False):
+def run_cmd(cmd):
     try:
-        if shell:
-            res = subprocess.run(' '.join(cmd), shell=True, capture_output=capture_output, text=True)
-        else:
-            res = subprocess.run(cmd, capture_output=capture_output, text=True)
-        if check and res.returncode != 0:
-            raise subprocess.CalledProcessError(res.returncode, cmd, res.stdout, res.stderr)
-        return res
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        return res.stdout.strip() if res.stdout else ""
     except Exception as e:
         console.log(f"[red]Command failed:[/red] {cmd} -> {e}")
-        return None
+        return ""
 
-def which(cmdname: str) -> bool:
-    return shutil.which(cmdname) is not None
+def install_tools():
+    tools = ["subfinder", "assetfinder", "gau", "waybackurls", "gf", "httpx"]
+    for t in tools:
+        if shutil.which(t) is None:
+            console.log(f"[yellow]{t} not found. Installing...[/yellow]")
+            if t=="httpx":
+                run_cmd("go install github.com/projectdiscovery/httpx/cmd/httpx@latest")
+            elif t=="gf":
+                run_cmd("go install github.com/tomnomnom/gf@latest")
+                run_cmd("mkdir -p ~/.gf && cp -r $(go env GOPATH)/pkg/mod/github.com/tomnomnom/gf*/examples/* ~/.gf/")
+            else:
+                run_cmd(f"go install github.com/projectdiscovery/{t}/v2/cmd/{t}@latest")
+    console.log("[green]All required tools installed![/green]")
 
-# ---- collectors (subdomains, URLs, JS, 403, interesting endpoints) ----
+# ---- collectors ----
+def get_subs(domain, outdir):
+    out_file = outdir/"subs.txt"
+    for t in ["subfinder", "assetfinder"]:
+        if shutil.which(t):
+            console.log(f"[cyan]Running {t}...[/cyan]")
+            res = run_cmd(f"{t} -d {domain} -silent")
+            if res:
+                with open(out_file,"a") as f: f.write(res+"\n")
+    console.log(f"[green]Subs saved -> {out_file}[/green]")
+    return out_file
 
-def run_subfinder(domain: str, out_file: Path):
-    if not which('subfinder'):
-        console.log('[yellow]subfinder not found, skipping subfinder step[/yellow]')
-        return
-    console.log('[cyan]Running subfinder...[/cyan]')
-    res = run_cmd(['subfinder', '-d', domain, '-silent'])
-    if res and res.stdout:
-        out_file.write_text(res.stdout)
+def get_urls(domain, outdir):
+    out_file = outdir/"urls.txt"
+    for t in ["gau", "waybackurls"]:
+        if shutil.which(t):
+            console.log(f"[cyan]Running {t}...[/cyan]")
+            res = run_cmd(f"{t} {domain}")
+            if res:
+                with open(out_file,"a") as f: f.write(res+"\n")
+    console.log(f"[green]URLs saved -> {out_file}[/green]")
+    return out_file
 
+def get_js(urls_file, outdir):
+    js_file = outdir/"js-file.txt"
+    if urls_file.exists():
+        with open(urls_file) as f:
+            lines = f.read().splitlines()
+        js_urls = [l for l in lines if l.endswith(".js")]
+        js_file.write_text("\n".join(js_urls))
+    console.log(f"[green]JS files saved -> {js_file}[/green]")
 
-def run_assetfinder(domain: str, out_file: Path):
-    if not which('assetfinder'):
-        console.log('[yellow]assetfinder not found, skipping assetfinder step[/yellow]')
-        return
-    console.log('[cyan]Running assetfinder...[/cyan]')
-    res = run_cmd(['assetfinder', '--subs-only', domain])
-    if res and res.stdout:
-        out_file.write_text(res.stdout)
+def extract_php(urls_file, outdir):
+    php_file = outdir/"php.txt"
+    if urls_file.exists():
+        with open(urls_file) as f:
+            lines = f.read().splitlines()
+        php_urls = [l for l in lines if ".php" in l]
+        php_file.write_text("\n".join(php_urls))
+    console.log(f"[green]PHP URLs saved -> {php_file}[/green]")
 
-
-def query_crtsh(domain: str) -> Set[str]:
-    console.log('[cyan]Querying crt.sh...[/cyan]')
-    domains = set()
-    url = f'https://crt.sh/?q=%25{domain}&output=json'
-    try:
-        r = requests.get(url, timeout=30)
-        if r.status_code == 200:
+def extract_params(urls_file, outdir):
+    from urllib.parse import urlparse, parse_qs
+    params_file = outdir/"params.txt"
+    if urls_file.exists():
+        lines = urls_file.read_text().splitlines()
+        all_params=[]
+        for u in lines:
             try:
-                data = r.json()
-                for entry in data:
-                    name = entry.get('name_value') or entry.get('common_name')
-                    if name:
-                        for line in str(name).split('\n'):
-                            line = line.strip().lstrip('*.')
-                            if line.endswith(domain):
-                                domains.add(line)
-            except Exception as e:
-                console.log(f'[red]crt.sh parse error:[/red] {e}')
-    except Exception as e:
-        console.log(f'[red]crt.sh request failed:[/red] {e}')
-    return domains
+                q=parse_qs(urlparse(u).query)
+                for k,v in q.items():
+                    all_params.append(f"{u} | {k} | {','.join(v)}")
+            except: continue
+        params_file.write_text("\n".join(all_params))
+    console.log(f"[green]Params saved -> {params_file}[/green]")
 
+def gf_patterns(urls_file, outdir):
+    patterns=["xss","sqli","lfi","rce","redirect"]
+    if not shutil.which("gf"): return
+    for pat in patterns:
+        out = outdir/f"gf_{pat}.txt"
+        run_cmd(f"cat {urls_file} | gf {pat} | sort -u > {out}")
+        console.log(f"[green]GF {pat} -> {out}[/green]")
 
-def run_gau(domain: str, out_file: Path):
-    if not which('gau'):
-        console.log('[yellow]gau not found, skipping gau step[/yellow]')
-        return
-    console.log('[cyan]Running gau (getallurls)...[/cyan]')
-    res = run_cmd(['gau', domain])
-    if res and res.stdout:
-        out_file.write_text(res.stdout)
+def extract_interest(subs_file, urls_file, outdir):
+    interesting = ["login","rest","password","update","admin"]
+    subs_out = outdir/"interest-subs.txt"
+    urls_out = outdir/"interest-urls.txt"
+    if subs_file.exists():
+        lines = subs_file.read_text().splitlines()
+        interest_subs = [l for l in lines if any(i in l for i in interesting)]
+        subs_out.write_text("\n".join(interest_subs))
+    if urls_file.exists():
+        lines = urls_file.read_text().splitlines()
+        interest_urls = [l for l in lines if any(i in l for i in interesting)]
+        urls_out.write_text("\n".join(interest_urls))
+    console.log(f"[green]Interest subs saved -> {subs_out}[/green]")
+    console.log(f"[green]Interest URLs saved -> {urls_out}[/green]")
 
+# ---- CLI ----
+def parse_args():
+    p=argparse.ArgumentParser()
+    p.add_argument("-d","--domain",help="Single target")
+    p.add_argument("-f","--file",help="Targets from file")
+    p.add_argument("-s","--subs",action="store_true",help="Get subs")
+    p.add_argument("-u","--urls",action="store_true",help="Get URLs")
+    p.add_argument("-j","--js",action="store_true",help="Get JS")
+    p.add_argument("-p","--params",action="store_true",help="Get params")
+    p.add_argument("--php",action="store_true",help="Get PHP URLs")
+    p.add_argument("-g","--gf",action="store_true",help="Run GF patterns")
+    p.add_argument("--interest",action="store_true",help="Extract interesting URLs/Subs")
+    p.add_argument("-all","--all",action="store_true",help="Run all steps")
+    p.add_argument("-o","--out",default="results",help="Output dir")
+    return p.parse_args()
 
-def run_waybackurls(domain: str, out_file: Path):
-    if not which('waybackurls'):
-        console.log('[yellow]waybackurls not found, skipping waybackurls step[/yellow]')
-        return
-    console.log('[cyan]Running waybackurls...[/cyan]')
-    p = subprocess.Popen(['waybackurls', domain], stdout=subprocess.PIPE, text=True)
-    out, _ = p.communicate(timeout=120)
-    if out:
-        out_file.write_text(out)
+def main():
+    args=parse_args()
+    out_base=Path(args.out)
+    targets=[]
+    if args.domain: targets=[args.domain.strip()]
+    elif args.file:
+        path=Path(args.file)
+        if not path.exists(): console.log(f"[red]File not found {path}[/red]"); return
+        targets=[l.strip() for l in path.read_text().splitlines() if l.strip()]
+    else: console.log("[red]Specify domain or file[/red]"); return
 
-# ---- extract interesting endpoints and JS ----
+    install_tools()
 
-def extract_interesting(urls: List[str], out_file: Path):
-    keywords = ['login', 'rest', 'password', 'update']
-    interesting = [u for u in urls if any(k in u.lower() for k in keywords)]
-    if interesting:
-        out_file.write_text('\n'.join(sorted(set(interesting))))
+    for t in targets:
+        t_out=out_base/t
+        t_out.mkdir(parents=True,exist_ok=True)
+        console.log(Panel(f"Recon for {t}",title="Start"))
 
+        subs_file = t_out/"subs.txt"
+        urls_file = t_out/"urls.txt"
 
-def extract_js_files(urls: List[str], out_file: Path):
-    js_files = [u for u in urls if u.lower().endswith('.js')]
-    if js_files:
-        out_file.write_text('\n'.join(sorted(set(js_files))))
+        if args.subs or args.all: get_subs(t,t_out)
+        if args.urls or args.all: get_urls(t,t_out)
+        if args.js or args.all: get_js(urls_file,t_out)
+        if args.php or args.all: extract_php(urls_file,t_out)
+        if args.params or args.all: extract_params(urls_file,t_out)
+        if args.gf or args.all: gf_patterns(urls_file,t_out)
+        if args.interest or args.all: extract_interest(subs_file,urls_file,t_out)
+
+        console.log(Panel(f"Done {t}",title="Finish"))
+
+if __name__=="__main__":
+    main()
