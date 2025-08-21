@@ -20,3 +20,60 @@ Professional Recon pipeline in Python with CLI options.
 ```bash
 bash install_requirements.sh
 
+
+
+
+```bash
+
+Usage:
+
+python recon.py -d example.com -all
+python recon.py -f targets.txt -s -u -j
+
+
+
+
+-d : single domain
+
+-f : file with domains
+
+-s : get subdomains
+
+-u : get URLs (gau + waybackurls)
+
+-j : get JS files
+
+-p : extract params
+
+--php : extract PHP URLs
+
+-g : run GF patterns (xss, sqli, lfi, rce, redirect)
+
+--interest : save "interesting" subs and URLs
+
+-all : run all steps
+
+
+
+
+------------------------------------------------------------------------------------------------
+All results saved in results/<target>/:
+
+subs.txt : all subdomains
+
+urls.txt : all URLs
+
+php.txt : PHP URLs
+
+params.txt : parameters
+
+js-file.txt : JS files
+
+gf_*.txt : GF pattern matches
+
+interest-urls.txt / interest-subs.txt : interesting URLs / subs
+
+
+
+
+
